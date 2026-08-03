@@ -201,9 +201,12 @@ jobs:
       # removes the concurrent-writer contention.
       - name: Upload build artifacts
         if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          tag_name: ${{env.TAG_NAME}}
-          files: |
-            ${{env.NORFW}}
-            ${{env.NANDFW}}
+          name: fw-${{ matrix.platform }}
+          if-no-files-found: ignore
+          path: |
+            output/images/openipc*.tgz
+            output/images/sizes.*.json
+            output/images/kconfig-graph.*.json
+            output/images/kconfig-help.*.json
