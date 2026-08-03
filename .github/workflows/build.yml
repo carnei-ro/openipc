@@ -7,13 +7,64 @@ on:
   #   - cron: '30 22 * * *'
   workflow_dispatch:
 
-env:
-  TAG_NAME: latest
-
 jobs:
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.gate.outputs.should_build }}
+      head_sha:     ${{ steps.gate.outputs.head_sha }}
+      short_sha:    ${{ steps.gate.outputs.short_sha }}
+      build_id:     ${{ steps.gate.outputs.build_id }}
+      built_at:     ${{ steps.gate.outputs.built_at }}
+      webui_digest: ${{ steps.gate.outputs.webui_digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          HEAD=$(git rev-parse HEAD)
+          SHORT=$(git rev-parse --short HEAD)
+          BUILD_ID="nightly-$(date -u +%Y%m%d)-${SHORT}"
+          BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          NOTES_PREV=$(gh release view nightly --json body -q .body 2>/dev/null || true)
+          PREV=$(printf '%s\n' "$NOTES_PREV" | sed -n 's/^sha=//p' | head -1)
+          PREV_WEBUI=$(printf '%s\n' "$NOTES_PREV" | sed -n 's/^webui=//p' | head -1)
+
+          # majestic-webui ships as a rolling `dist` release asset, so a WebUI fix
+          # changes what the nightly would contain without ever moving this repo's
+          # HEAD — on a quiet firmware tree the schedule would skip forever and the
+          # fix would never reach an image. Compare the asset's content digest as
+          # well. It is content-addressed, so a re-upload of identical bytes does
+          # not force a pointless rebuild. An empty value (API hiccup, or an asset
+          # with no digest) falls through to building: stale is worse than spare.
+          WEBUI=$(gh api repos/OpenIPC/majestic-webui/releases/tags/dist \
+                    --jq '.assets[]|select(.name=="majestic-webui-dist.tar.gz")|.digest // empty' \
+                    2>/dev/null || true)
+
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$PREV" = "$HEAD" ] \
+             && [ -n "$WEBUI" ] && [ "$PREV_WEBUI" = "$WEBUI" ]; then
+            echo "Skip: HEAD ($HEAD) already published as the latest nightly, majestic-webui dist unchanged ($WEBUI)."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Build: $BUILD_ID (event=${{ github.event_name }}, prev=$PREV, webui=$WEBUI, prev_webui=$PREV_WEBUI)"
+            echo "should_build=true"  >> "$GITHUB_OUTPUT"
+          fi
+          echo "head_sha=$HEAD"   >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT" >> "$GITHUB_OUTPUT"
+          echo "build_id=$BUILD_ID" >> "$GITHUB_OUTPUT"
+          echo "built_at=$BUILT_AT" >> "$GITHUB_OUTPUT"
+          echo "webui_digest=$WEBUI" >> "$GITHUB_OUTPUT"
+
   buildroot:
     name: Firmware
+    needs: preflight
+    if: needs.preflight.outputs.should_build == 'true'
     runs-on: ubuntu-latest
+    env:
+      BUILD_ID:  ${{ needs.preflight.outputs.build_id }}
+      BUILD_SHA: ${{ needs.preflight.outputs.head_sha }}
 
     strategy:
       fail-fast: false
@@ -44,6 +95,40 @@ jobs:
           path: /tmp/ccache
           key: ${{matrix.platform}}-${{env.CACHE_DATE}}
 
+      - name: Setup dl cache
+        if: github.event_name != 'pull_request'
+        uses: actions/cache@v4
+        with:
+          path: output/dl
+          key: dl-${{env.CACHE_DATE}}
+          restore-keys: dl-
+
+      - name: Restore dl cache
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@v4
+        with:
+          path: output/dl
+          key: dl-${{env.CACHE_DATE}}
+          restore-keys: dl-
+
+      - name: Refresh moving-ref package downloads
+        run: |
+          # Packages pinned to a moving ref keep a constant download filename. The dl
+          # cache key is the month (date +%m) and actions/cache only saves on a key
+          # miss, so that snapshot is frozen for weeks; buildroot then keeps reusing the
+          # stale tarball and the nightly silently ships an old version. This is what
+          # desynced majestic-webui from majestic (blanking settings labels; later a t31
+          # lite image shipped a pre-x-groups majestic vs the current webui — "No
+          # settings groups in schema"). Drop both naming forms so buildroot re-fetches:
+          #   - dash:  <pkg>-<ref>.tar.gz   e.g. majestic-webui-dist.tar.gz
+          #   - dot:   <pkg>.<ref>.tar.bz2  e.g. majestic.t31.lite.master.tar.bz2
+          # The dot form is majestic's S3 tarball — it LOOKS S3-pinned but is a moving
+          # `master` build re-uploaded every majestic CI run, with no .hash to force a
+          # refetch. Only genuinely content-addressed tarballs (semver / SHA) keep cache.
+          find output/dl -type f -regextype posix-extended \
+            -regex '.*[-.](HEAD|master|main|dist)\.tar\.(gz|bz2|xz)' \
+            -print -delete 2>/dev/null || true
+
       - name: Build firmware
         run: |
           export GIT_HASH=$(git rev-parse --short ${GITHUB_SHA})
@@ -53,7 +138,23 @@ jobs:
 
           mkdir -p /tmp/ccache
           ln -s /tmp/ccache ${HOME}/.ccache
-          make BOARD=${{matrix.platform}}
+
+          # Backoffs give 7 attempts total. The longer tail (600, 1200) covers
+          # the GitHub releases CDN / toolchain mirror flakes that took down
+          # hi3516av100_ultimate on 2026-05-20 (run 26196546684) — 502s
+          # storming for >10 min outlasted the previous 30/60/120/300 budget.
+          backoffs="30 60 120 300 600 1200"
+          attempt=1
+          for sleep_for in $backoffs ""; do
+            make BOARD=${{matrix.platform}} && break
+            if [ -z "$sleep_for" ]; then
+              echo "::error::build failed after ${attempt} attempts"
+              exit 1
+            fi
+            echo "::warning::attempt ${attempt} failed, retrying after ${sleep_for}s"
+            sleep "$sleep_for"
+            attempt=$((attempt + 1))
+          done
 
           TIME=$(date -d @${SECONDS} +%M:%S)
           echo TIME=${TIME} >> ${GITHUB_ENV}
@@ -68,9 +169,39 @@ jobs:
             echo NANDFW=${NANDFW} >> ${GITHUB_ENV}
           fi
 
-      - name: Upload firmware
+      - name: Verify kernel modules
+        run: sh .github/scripts/check_target_modules.sh
+
+      - name: Build size report
+        run: |
+          make BOARD=${{matrix.platform}} size-report || \
+            echo "::warning::size-report failed for ${{matrix.platform}}"
+          SIZES=$(find output/images -name 'sizes.*.json' | head -1)
+          if [ -e "$SIZES" ]; then
+            echo "SIZES=$SIZES" >> ${GITHUB_ENV}
+          fi
+
+      - name: Build kconfig graph
+        run: |
+          python3 -m pip install --user --break-system-packages kconfiglib || \
+            { echo "::warning::kconfiglib install failed for ${{matrix.platform}}"; exit 0; }
+          make BOARD=${{matrix.platform}} kconfig-graph || \
+            { echo "::warning::kconfig-graph failed for ${{matrix.platform}}"; exit 0; }
+          KCONFIG=$(find output/images -name 'kconfig-graph.*.json' | head -1)
+          KHELP=$(find output/images -name 'kconfig-help.*.json' | head -1)
+          if [ -e "$KCONFIG" ]; then echo "KCONFIG=$KCONFIG" >> ${GITHUB_ENV}; fi
+          if [ -e "$KHELP" ]; then echo "KHELP=$KHELP" >> ${GITHUB_ENV}; fi
+
+      # Hand the firmware + sidecars to the single `publish` job instead of
+      # uploading to releases from here. ~90 matrix jobs all deleting and
+      # re-uploading assets on the SAME shared `nightly`/`latest` releases at
+      # once made the GitHub releases API return HTTP 500 ("Server Error") —
+      # e.g. run 27108181857, where every build succeeded but 14 jobs went red
+      # in their upload step. Consolidating every release write into one job
+      # removes the concurrent-writer contention.
+      - name: Upload build artifacts
         if: github.event_name != 'pull_request'
-        uses: softprops/action-gh-release@v2
+        uses: actions/upload-artifact@v4
         with:
           tag_name: ${{env.TAG_NAME}}
           files: |
